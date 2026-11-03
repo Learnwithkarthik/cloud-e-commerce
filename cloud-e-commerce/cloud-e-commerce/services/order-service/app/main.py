@@ -1,11 +1,12 @@
 import os
+import hashlib
 from collections import defaultdict
 from contextlib import contextmanager
 from decimal import Decimal
 
 import psycopg
 from psycopg.rows import dict_row
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Cookie
 from pydantic import BaseModel, EmailStr, Field, ConfigDict
 
 app = FastAPI(title="Cloud E-Commerce Orders API", docs_url=None, redoc_url=None)
@@ -32,7 +33,7 @@ def health():
     return {"status": "ok", "service": "order-service"}
 
 @app.post("/api/orders", status_code=201)
-def place_order(payload: PlaceOrderRequest):
+def place_order(payload: PlaceOrderRequest, cloudcart_session: str | None = Cookie(default=None)):
     quantities: dict[int, int] = defaultdict(int)
     for item in payload.items:
         quantities[item.product_id] += item.quantity
@@ -42,6 +43,18 @@ def place_order(payload: PlaceOrderRequest):
     # Server recomputes prices and atomically reserves stock. Never trust prices from a browser.
     with db_connection() as conn:
         with conn.transaction():
+            customer_id = None
+            if cloudcart_session:
+                match = conn.execute("""SELECT a.id, a.email FROM customer_sessions s
+                    JOIN customer_accounts a ON a.id=s.customer_id
+                    WHERE s.token_hash=%s AND s.expires_at > NOW()""", (hashlib.sha256(cloudcart_session.encode()).hexdigest(),)).fetchone()
+                if not match:
+                    raise HTTPException(status_code=401, detail="Session expired. Sign in again")
+                customer_id = match['id']
+                # Orders must never be associated with a different user's email.
+                order_email = match['email']
+            else:
+                order_email = str(payload.customer_email).lower()
             products = conn.execute(
                 "SELECT id, name, price, stock FROM products WHERE id = ANY(%s) ORDER BY id FOR UPDATE",
                 (list(quantities),),
@@ -53,8 +66,8 @@ def place_order(payload: PlaceOrderRequest):
                     raise HTTPException(status_code=409, detail=f"Not enough stock for {product['name']}")
             total = sum((p["price"] * quantities[p["id"]] for p in products), Decimal("0.00"))
             order = conn.execute(
-                "INSERT INTO orders (customer_name, customer_email, total) VALUES (%s,%s,%s) RETURNING id, status",
-                (payload.customer_name.strip(), str(payload.customer_email), total),
+                "INSERT INTO orders (customer_name, customer_email, total, customer_id) VALUES (%s,%s,%s,%s) RETURNING id, status",
+                (payload.customer_name.strip(), order_email, total, customer_id),
             ).fetchone()
             for product in products:
                 qty = quantities[product["id"]]
