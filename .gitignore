@@ -1,0 +1,14 @@
+# Environment secrets
+.env
+**/.env
+
+# Local configuration backups
+*.pre-v3
+
+# Python
+__pycache__/
+*.pyc
+
+# Node.js
+node_modules/
+dist/
